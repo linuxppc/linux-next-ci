@@ -1,0 +1,38 @@
+name: powerpc/update
+
+# Controls when the action will run.
+on:
+  # update at 2am AEST == 4pm UTC
+  schedule:
+    - cron: '0 16 * * *'
+  # This allows the build to be triggered manually via the github UI.
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Fetch linux-next
+      run: |
+        git fetch https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git
+        git branch -f linux-next FETCH_HEAD
+
+    - name: Rebase
+      run: |
+        git config user.name "linuxppc"
+        git config user.email "linuxppc@github.com"
+        # We need to fetch another commit so HEAD^ will work
+        git fetch --deepen=1 origin
+        # Rebase tip of main (current branch) onto linux-next
+        git rebase --onto linux-next HEAD^
+        # Get next datestamp
+        date=$(git log -1 --format=%s linux-next | tr -d "[A-Za-z\- ]")
+        # Update commit subject
+        git commit --amend -m "CI: Add CI configuration to linux-next $date"
+
+    - name: Push
+      run: |
+        # Push back to main
+        git push -f origin main:main
