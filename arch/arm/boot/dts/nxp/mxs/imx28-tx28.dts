@@ -247,8 +247,12 @@
 
 &gpmi {
 	pinctrl-0 = <&gpmi_pins_a &gpmi_status_cfg>;
-	nand-on-flash-bbt;
 	status = "okay";
+
+	nand@0 {
+		reg = <0>;
+		nand-on-flash-bbt;
+	};
 };
 
 &i2c0 {
