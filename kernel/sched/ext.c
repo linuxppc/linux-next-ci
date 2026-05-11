@@ -6880,6 +6880,7 @@ static struct scx_sched *scx_alloc_and_add_sched(struct scx_enable_cmd *cmd,
 		ret = kobject_init_and_add(&sch->kobj, &scx_ktype, NULL, "root");
 
 	if (ret < 0) {
+		RCU_INIT_POINTER(ops->priv, NULL);
 		kobject_put(&sch->kobj);
 		return ERR_PTR(ret);
 	}
@@ -6887,6 +6888,7 @@ static struct scx_sched *scx_alloc_and_add_sched(struct scx_enable_cmd *cmd,
 	if (ops->sub_attach) {
 		sch->sub_kset = kset_create_and_add("sub", NULL, &sch->kobj);
 		if (!sch->sub_kset) {
+			RCU_INIT_POINTER(ops->priv, NULL);
 			kobject_put(&sch->kobj);
 			return ERR_PTR(-ENOMEM);
 		}
@@ -6894,6 +6896,7 @@ static struct scx_sched *scx_alloc_and_add_sched(struct scx_enable_cmd *cmd,
 #else	/* CONFIG_EXT_SUB_SCHED */
 	ret = kobject_init_and_add(&sch->kobj, &scx_ktype, NULL, "root");
 	if (ret < 0) {
+		RCU_INIT_POINTER(ops->priv, NULL);
 		kobject_put(&sch->kobj);
 		return ERR_PTR(ret);
 	}
@@ -6902,6 +6905,7 @@ static struct scx_sched *scx_alloc_and_add_sched(struct scx_enable_cmd *cmd,
 
 #ifdef CONFIG_EXT_SUB_SCHED
 err_free_lb_resched:
+	RCU_INIT_POINTER(ops->priv, NULL);
 	free_cpumask_var(sch->bypass_lb_resched_cpumask);
 #endif
 err_free_lb_cpumask:
