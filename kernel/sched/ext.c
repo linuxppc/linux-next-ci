@@ -4967,6 +4967,8 @@ static void scx_sched_free_rcu_work(struct work_struct *work)
 	kfree(sch->cgrp_path);
 	if (sch_cgroup(sch))
 		cgroup_put(sch_cgroup(sch));
+	if (sch->sub_kset)
+		kobject_put(&sch->sub_kset->kobj);
 #endif	/* CONFIG_EXT_SUB_SCHED */
 
 	for_each_possible_cpu(cpu) {
@@ -6027,7 +6029,7 @@ static void scx_sub_disable(struct scx_sched *sch)
 	if (sch->ops.exit)
 		SCX_CALL_OP(sch, exit, NULL, sch->exit_info);
 	if (sch->sub_kset)
-		kset_unregister(sch->sub_kset);
+		kobject_del(&sch->sub_kset->kobj);
 	kobject_del(&sch->kobj);
 }
 #else	/* CONFIG_EXT_SUB_SCHED */
@@ -6153,7 +6155,7 @@ static void scx_root_disable(struct scx_sched *sch)
 	 */
 #ifdef CONFIG_EXT_SUB_SCHED
 	if (sch->sub_kset)
-		kset_unregister(sch->sub_kset);
+		kobject_del(&sch->sub_kset->kobj);
 #endif
 	kobject_del(&sch->kobj);
 
@@ -6842,6 +6844,7 @@ static struct scx_sched *scx_alloc_and_add_sched(struct scx_enable_cmd *cmd,
 	rcu_assign_pointer(ops->priv, sch);
 
 	sch->kobj.kset = scx_kset;
+	INIT_LIST_HEAD(&sch->all);
 
 #ifdef CONFIG_EXT_SUB_SCHED
 	char *buf = kzalloc(PATH_MAX, GFP_KERNEL);
