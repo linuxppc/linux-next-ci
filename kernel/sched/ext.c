@@ -7672,8 +7672,7 @@ static s32 scx_enable(struct scx_enable_cmd *cmd, struct bpf_link *link)
 	static struct kthread_worker *helper;
 	static DEFINE_MUTEX(helper_mutex);
 
-	if (!cpumask_equal(housekeeping_cpumask(HK_TYPE_DOMAIN),
-			   cpu_possible_mask)) {
+	if (housekeeping_enabled(HK_TYPE_DOMAIN_BOOT)) {
 		pr_err("sched_ext: Not compatible with \"isolcpus=\" domain isolation\n");
 		return -EINVAL;
 	}
