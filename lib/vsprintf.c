@@ -59,7 +59,7 @@
 
 /* Disable pointer hashing if requested */
 bool no_hash_pointers __ro_after_init;
-EXPORT_SYMBOL_GPL(no_hash_pointers);
+EXPORT_SYMBOL_FOR_MODULES(no_hash_pointers, "printf_kunit");
 
 /*
  * Hashed pointers policy selected by "hash_pointers=..." boot param
@@ -857,6 +857,7 @@ static char *default_pointer(char *buf, char *end, const void *ptr,
 }
 
 int kptr_restrict __read_mostly;
+EXPORT_SYMBOL_FOR_MODULES(kptr_restrict, "printf_kunit");
 
 static noinline_for_stack
 char *restricted_pointer(char *buf, char *end, const void *ptr,
