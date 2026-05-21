@@ -32,11 +32,17 @@
 #define CMASK_MAX_WORDS 129
 #endif
 
-#define CMASK_NR_WORDS(nr_bits)		(((nr_bits) + 63) / 64 + 1)
+/*
+ * Mirrors SCX_CMASK_NR_WORDS in kernel/sched/ext_types.h. The u64 cast keeps
+ * the +63 from wrapping when @nr_cids is near U32_MAX, so cmask_reframe()
+ * bounds-checking the result against alloc_words catches the overflow instead
+ * of seeing a small value.
+ */
+#define CMASK_NR_WORDS(nr_cids)		((u32)(((u64)(nr_cids) + 63) / 64 + 1))
 
 static __always_inline bool __cmask_contains(const struct scx_cmask __arena *m, u32 cid)
 {
-	return cid >= m->base && cid < m->base + m->nr_bits;
+	return cid >= m->base && cid < m->base + m->nr_cids;
 }
 
 static __always_inline u64 __arena *__cmask_word(const struct scx_cmask __arena *m, u32 cid)
@@ -44,18 +50,76 @@ static __always_inline u64 __arena *__cmask_word(const struct scx_cmask __arena 
 	return (u64 __arena *)&m->bits[cid / 64 - m->base / 64];
 }
 
-static __always_inline void cmask_init(struct scx_cmask __arena *m, u32 base, u32 nr_bits)
+/**
+ * __cmask_init - Initialize @m with explicit storage capacity
+ * @m: cmask to initialize
+ * @base: first cid of the active range
+ * @nr_cids: number of cids in the active range
+ * @alloc_cids: storage capacity in cids, at least @nr_cids
+ *
+ * Use when storage is sized larger than the initial active range. All of
+ * bits[] is zeroed.
+ */
+static __always_inline void __cmask_init(struct scx_cmask __arena *m, u32 base,
+					 u32 nr_cids, u32 alloc_cids)
 {
-	u32 nr_words = CMASK_NR_WORDS(nr_bits), i;
+	u32 alloc_words, i;
+
+	if (unlikely(nr_cids > alloc_cids)) {
+		scx_bpf_error("__cmask_init: nr_cids=%u exceeds alloc_cids=%u",
+			      nr_cids, alloc_cids);
+		return;
+	}
+	alloc_words = CMASK_NR_WORDS(alloc_cids);
 
 	m->base = base;
-	m->nr_bits = nr_bits;
+	m->nr_cids = nr_cids;
+	m->alloc_words = alloc_words;
 
 	bpf_for(i, 0, CMASK_MAX_WORDS) {
-		if (i >= nr_words)
+		if (i >= alloc_words)
 			break;
 		m->bits[i] = 0;
 	}
+}
+
+/**
+ * cmask_init - Initialize @m on tight storage
+ * @m: cmask to initialize
+ * @base: first cid of the active range
+ * @nr_cids: number of cids in the active range
+ *
+ * All of bits[] is zeroed.
+ */
+static __always_inline void cmask_init(struct scx_cmask __arena *m, u32 base, u32 nr_cids)
+{
+	__cmask_init(m, base, nr_cids, nr_cids);
+}
+
+/**
+ * cmask_reframe - Reshape @m's active range without resizing storage
+ * @m: cmask to reframe
+ * @base: new active range base
+ * @nr_cids: new active range length, must fit within @m->alloc_words
+ *
+ * Body bits within the new range become garbage - only the head and tail
+ * words are zeroed to keep the padding invariant.
+ */
+static __always_inline void cmask_reframe(struct scx_cmask __arena *m, u32 base, u32 nr_cids)
+{
+	if (CMASK_NR_WORDS(nr_cids) > m->alloc_words) {
+		scx_bpf_error("cmask_reframe: nr_cids=%u exceeds alloc_words=%u",
+			      nr_cids, m->alloc_words);
+		return;
+	}
+	if (nr_cids) {
+		u32 last_word = ((base & 63) + nr_cids - 1) / 64;
+
+		m->bits[0] = 0;
+		m->bits[last_word] = 0;
+	}
+	m->base = base;
+	m->nr_cids = nr_cids;
 }
 
 static __always_inline bool cmask_test(const struct scx_cmask __arena *m, u32 cid)
@@ -206,7 +270,7 @@ static __always_inline bool __cmask_test_and_clear(struct scx_cmask __arena *m, 
 
 static __always_inline void cmask_zero(struct scx_cmask __arena *m)
 {
-	u32 nr_words = CMASK_NR_WORDS(m->nr_bits), i;
+	u32 nr_words = CMASK_NR_WORDS(m->nr_cids), i;
 
 	bpf_for(i, 0, CMASK_MAX_WORDS) {
 		if (i >= nr_words)
@@ -250,8 +314,8 @@ static __always_inline void cmask_op_word(struct scx_cmask __arena *dst,
 static __always_inline void cmask_op(struct scx_cmask __arena *dst,
 				     const struct scx_cmask __arena *src, int op)
 {
-	u32 d_end = dst->base + dst->nr_bits;
-	u32 s_end = src->base + src->nr_bits;
+	u32 d_end = dst->base + dst->nr_cids;
+	u32 s_end = src->base + src->nr_cids;
 	u32 lo = dst->base > src->base ? dst->base : src->base;
 	u32 hi = d_end < s_end ? d_end : s_end;
 	u32 d_base = dst->base / 64;
@@ -286,8 +350,8 @@ static __always_inline void cmask_op(struct scx_cmask __arena *dst,
 
 /*
  * cmask_and/or/copy only modify @dst bits that lie in the intersection of
- * [@dst->base, @dst->base + @dst->nr_bits) and [@src->base,
- * @src->base + @src->nr_bits). Bits in @dst outside that window
+ * [@dst->base, @dst->base + @dst->nr_cids) and [@src->base,
+ * @src->base + @src->nr_cids). Bits in @dst outside that window
  * keep their prior values - in particular, cmask_copy() does NOT zero @dst
  * bits that lie outside @src's range.
  */
@@ -325,9 +389,9 @@ static __always_inline bool cmask_equal(const struct scx_cmask __arena *a,
 {
 	u32 nr_words, i;
 
-	if (a->base != b->base || a->nr_bits != b->nr_bits)
+	if (a->base != b->base || a->nr_cids != b->nr_cids)
 		return false;
-	nr_words = CMASK_NR_WORDS(a->nr_bits);
+	nr_words = CMASK_NR_WORDS(a->nr_cids);
 
 	bpf_for(i, 0, CMASK_MAX_WORDS) {
 		if (i >= nr_words)
@@ -345,8 +409,8 @@ static __always_inline bool cmask_equal(const struct scx_cmask __arena *a,
 static __always_inline bool cmask_subset(const struct scx_cmask __arena *a,
 					 const struct scx_cmask __arena *b)
 {
-	u32 a_end = a->base + a->nr_bits;
-	u32 b_end = b->base + b->nr_bits;
+	u32 a_end = a->base + a->nr_cids;
+	u32 b_end = b->base + b->nr_cids;
 	u32 a_wbase = a->base / 64;
 	u32 b_wbase = b->base / 64;
 	u32 nr_words, i;
@@ -355,7 +419,7 @@ static __always_inline bool cmask_subset(const struct scx_cmask __arena *a,
 	if (a->base < b->base || a_end > b_end)
 		return false;
 
-	nr_words = CMASK_NR_WORDS(a->nr_bits);
+	nr_words = CMASK_NR_WORDS(a->nr_cids);
 	bpf_for(i, 0, CMASK_MAX_WORDS) {
 		u32 wi_b;
 
@@ -373,13 +437,13 @@ static __always_inline bool cmask_subset(const struct scx_cmask __arena *a,
  * @m: cmask to search
  * @cid: starting cid (clamped to @m->base if below)
  *
- * Returns the smallest set cid in [@cid, @m->base + @m->nr_bits), or
- * @m->base + @m->nr_bits if none (the out-of-range sentinel matches the
+ * Returns the smallest set cid in [@cid, @m->base + @m->nr_cids), or
+ * @m->base + @m->nr_cids if none (the out-of-range sentinel matches the
  * termination condition used by cmask_for_each()).
  */
 static __always_inline u32 cmask_next_set(const struct scx_cmask __arena *m, u32 cid)
 {
-	u32 end = m->base + m->nr_bits;
+	u32 end = m->base + m->nr_cids;
 	u32 base = m->base / 64;
 	u32 last_wi = (end - 1) / 64 - base;
 	u32 start_wi, start_bit, i;
@@ -421,17 +485,17 @@ static __always_inline u32 cmask_first_set(const struct scx_cmask __arena *m)
 
 #define cmask_for_each(cid, m)							\
 	for ((cid) = cmask_first_set(m);					\
-	     (cid) < (m)->base + (m)->nr_bits;					\
+	     (cid) < (m)->base + (m)->nr_cids;					\
 	     (cid) = cmask_next_set((m), (cid) + 1))
 
 /*
- * Population count over [base, base + nr_bits). Padding bits in the head/tail
+ * Population count over [base, base + nr_cids). Padding bits in the head/tail
  * words are guaranteed zero by the mutating helpers, so a flat popcount over
  * all words is correct.
  */
 static __always_inline u32 cmask_weight(const struct scx_cmask __arena *m)
 {
-	u32 nr_words = CMASK_NR_WORDS(m->nr_bits), i;
+	u32 nr_words = CMASK_NR_WORDS(m->nr_cids), i;
 	u32 count = 0;
 
 	bpf_for(i, 0, CMASK_MAX_WORDS) {
@@ -449,8 +513,8 @@ static __always_inline u32 cmask_weight(const struct scx_cmask __arena *m)
 static __always_inline bool cmask_intersects(const struct scx_cmask __arena *a,
 					     const struct scx_cmask __arena *b)
 {
-	u32 a_end = a->base + a->nr_bits;
-	u32 b_end = b->base + b->nr_bits;
+	u32 a_end = a->base + a->nr_cids;
+	u32 b_end = b->base + b->nr_cids;
 	u32 lo = a->base > b->base ? a->base : b->base;
 	u32 hi = a_end < b_end ? a_end : b_end;
 	u32 a_base = a->base / 64;
@@ -489,7 +553,7 @@ static __always_inline bool cmask_intersects(const struct scx_cmask __arena *a,
 
 /*
  * Find the next cid set in both @a and @b at or after @start, bounded by the
- * intersection of the two ranges. Return a->base + a->nr_bits if none found.
+ * intersection of the two ranges. Return a->base + a->nr_cids if none found.
  *
  * Building block for cmask_next_and_set_wrap(). Callers that want a bounded
  * scan without wrap call this directly.
@@ -498,8 +562,8 @@ static __always_inline u32 cmask_next_and_set(const struct scx_cmask __arena *a,
 					      const struct scx_cmask __arena *b,
 					      u32 start)
 {
-	u32 a_end = a->base + a->nr_bits;
-	u32 b_end = b->base + b->nr_bits;
+	u32 a_end = a->base + a->nr_cids;
+	u32 b_end = b->base + b->nr_cids;
 	u32 a_wbase = a->base / 64;
 	u32 b_wbase = b->base / 64;
 	u32 lo = a->base > b->base ? a->base : b->base;
@@ -541,15 +605,15 @@ static __always_inline u32 cmask_next_and_set(const struct scx_cmask __arena *a,
 
 /*
  * Find the next set cid in @m at or after @start, wrapping to @m->base if no
- * set bit is found in [start, m->base + m->nr_bits). Return m->base +
- * m->nr_bits if @m is empty.
+ * set bit is found in [start, m->base + m->nr_cids). Return m->base +
+ * m->nr_cids if @m is empty.
  *
  * Callers do round-robin distribution by passing (last_cid + 1) as @start.
  */
 static __always_inline u32 cmask_next_set_wrap(const struct scx_cmask __arena *m,
 					       u32 start)
 {
-	u32 end = m->base + m->nr_bits;
+	u32 end = m->base + m->nr_cids;
 	u32 found;
 
 	found = cmask_next_set(m, start);
@@ -562,7 +626,7 @@ static __always_inline u32 cmask_next_set_wrap(const struct scx_cmask __arena *m
 
 /*
  * Find the next cid set in both @a and @b at or after @start, wrapping to
- * @a->base if none found in the forward half. Return a->base + a->nr_bits
+ * @a->base if none found in the forward half. Return a->base + a->nr_cids
  * if the intersection is empty.
  *
  * Callers do round-robin distribution by passing (last_cid + 1) as @start.
@@ -571,7 +635,7 @@ static __always_inline u32 cmask_next_and_set_wrap(const struct scx_cmask __aren
 						   const struct scx_cmask __arena *b,
 						   u32 start)
 {
-	u32 a_end = a->base + a->nr_bits;
+	u32 a_end = a->base + a->nr_cids;
 	u32 found;
 
 	found = cmask_next_and_set(a, b, start);
@@ -585,7 +649,7 @@ static __always_inline u32 cmask_next_and_set_wrap(const struct scx_cmask __aren
 /**
  * cmask_from_cpumask - translate a kernel cpumask to a cid-space cmask
  * @m: cmask to fill. Zeroed first; only bits within [@m->base, @m->base +
- *     @m->nr_bits) are updated - cpus mapping to cids outside that range
+ *     @m->nr_cids) are updated - cpus mapping to cids outside that range
  *     are ignored.
  * @cpumask: kernel cpumask to translate
  *
@@ -622,7 +686,7 @@ static __always_inline void cmask_from_cpumask(struct scx_cmask __arena *m,
 static __always_inline void cmask_copy_from_kernel(struct scx_cmask __arena *dst,
 						   const struct scx_cmask *src)
 {
-	u32 base = 0, nr_bits = 0, nr_words, wi;
+	u32 base = 0, nr_cids = 0, nr_words, wi;
 
 	if (dst->base != 0) {
 		scx_bpf_error("cmask_copy_from_kernel requires dst->base == 0");
@@ -638,18 +702,18 @@ static __always_inline void cmask_copy_from_kernel(struct scx_cmask __arena *dst
 		return;
 	}
 
-	if (bpf_probe_read_kernel(&nr_bits, sizeof(nr_bits), &src->nr_bits)) {
-		scx_bpf_error("probe-read cmask->nr_bits failed");
+	if (bpf_probe_read_kernel(&nr_cids, sizeof(nr_cids), &src->nr_cids)) {
+		scx_bpf_error("probe-read cmask->nr_cids failed");
 		return;
 	}
 
-	if (nr_bits > dst->nr_bits) {
-		scx_bpf_error("src cmask nr_bits=%u exceeds dst nr_bits=%u",
-			      nr_bits, dst->nr_bits);
+	if (nr_cids > dst->nr_cids) {
+		scx_bpf_error("src cmask nr_cids=%u exceeds dst nr_cids=%u",
+			      nr_cids, dst->nr_cids);
 		return;
 	}
 
-	nr_words = CMASK_NR_WORDS(nr_bits);
+	nr_words = CMASK_NR_WORDS(nr_cids);
 	cmask_zero(dst);
 	bpf_for(wi, 0, CMASK_MAX_WORDS) {
 		u64 word = 0;
