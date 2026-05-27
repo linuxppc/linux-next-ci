@@ -151,6 +151,9 @@ static struct res_config {
 	/* MEMSS_PMA_CR registers. */
 	u32 reg_mem_config_offset;
 	u32 reg_mem_config_ddr_type_mask;
+	u32 reg_mem_config_ibecc_en_mask;
+	u32 reg_capabilities_misc_offset;
+	u32 reg_capabilities_misc_ibecc_dis;
 	/* Memory controller registers. */
 	u32 reg_mad_inter_size_mask[NUM_CHANNELS];
 	u64 reg_mad_inter_size_granularity;
@@ -314,6 +317,12 @@ static struct work_struct ecclog_work;
 /* Compute die IDs for Wildcat Lake with IBECC */
 #define DID_WCL_SKU1	0xfd00
 
+/* Compute die IDs for Nova Lake-H/HX with IBECC */
+#define DID_NVL_H_SKU1	0xd701
+#define DID_NVL_H_SKU2	0xd702
+#define DID_NVL_H_SKU3	0xd704
+#define DID_NVL_H_SKU4	0xd705
+
 static int get_mchbar(struct pci_dev *pdev, u64 *mchbar)
 {
 	union  {
@@ -405,27 +414,26 @@ static bool mtl_p_ibecc_available(struct pci_dev *pdev)
 	return !(CAPID_E_IBECC_BIT18 & v);
 }
 
-static bool mtl_ps_ibecc_available(struct pci_dev *pdev)
+static bool generic_ibecc_available(struct pci_dev *pdev)
 {
-#define MCHBAR_MEMSS_IBECCDIS	0x13c00
-	void __iomem *window;
-	u64 mchbar;
+	void __iomem *base = igen6_pvt->memss_pma_cr;
+	bool present;
 	u32 val;
 
-	if (get_mchbar(pdev, &mchbar))
-		return false;
-
-	window = ioremap(mchbar, MCHBAR_SIZE * 2);
-	if (!window) {
-		igen6_printk(KERN_ERR, "Failed to ioremap 0x%llx\n", mchbar);
-		return false;
+	if (res_cfg->reg_capabilities_misc_offset) {
+		val = readl(base + res_cfg->reg_capabilities_misc_offset);
+		present = !(val & res_cfg->reg_capabilities_misc_ibecc_dis);
+		edac_dbg(2, "capabilities misc reg 0x%x\n", val);
+	} else if (res_cfg->reg_mem_config_offset) {
+		val = readl(base + res_cfg->reg_mem_config_offset);
+		present = !!(val & res_cfg->reg_mem_config_ibecc_en_mask);
+		edac_dbg(2, "mem config reg 0x%x\n", val);
+	} else {
+		igen6_printk(KERN_ERR, "No register for detecting IBECC presence.\n");
+		present = false;
 	}
 
-	val = readl(window + MCHBAR_MEMSS_IBECCDIS);
-	iounmap(window);
-
-	/* Bit6: 1 - IBECC is disabled, 0 - IBECC isn't disabled */
-	return !GET_BITFIELD(val, 6, 6);
+	return present;
 }
 
 static u64 mem_addr_to_sys_addr(u64 maddr)
@@ -725,18 +733,20 @@ static struct res_config rpl_p_cfg = {
 };
 
 static struct res_config mtl_ps_cfg = {
-	.machine_check		= true,
-	.num_imc		= 2,
-	.reg_mchbar_mask	= GENMASK_ULL(41, 17),
-	.reg_tom_mask		= GENMASK_ULL(41, 20),
-	.reg_touud_mask		= GENMASK_ULL(41, 20),
-	.reg_eccerrlog_addr_mask = GENMASK_ULL(38, 5),
-	.imc_base		= 0xd800,
-	.ibecc_base		= 0xd400,
-	.ibecc_error_log_offset	= 0x170,
-	.ibecc_available	= mtl_ps_ibecc_available,
-	.err_addr_to_sys_addr	= adl_err_addr_to_sys_addr,
-	.err_addr_to_imc_addr	= adl_err_addr_to_imc_addr,
+	.machine_check				= true,
+	.num_imc				= 2,
+	.reg_mchbar_mask			= GENMASK_ULL(41, 17),
+	.reg_tom_mask				= GENMASK_ULL(41, 20),
+	.reg_touud_mask				= GENMASK_ULL(41, 20),
+	.reg_eccerrlog_addr_mask		= GENMASK_ULL(38, 5),
+	.reg_capabilities_misc_offset		= 0x13c00,
+	.reg_capabilities_misc_ibecc_dis	= BIT(6),
+	.imc_base				= 0xd800,
+	.ibecc_base				= 0xd400,
+	.ibecc_error_log_offset			= 0x170,
+	.ibecc_available			= generic_ibecc_available,
+	.err_addr_to_sys_addr			= adl_err_addr_to_sys_addr,
+	.err_addr_to_imc_addr			= adl_err_addr_to_imc_addr,
 };
 
 static struct res_config mtl_p_cfg = {
@@ -797,6 +807,37 @@ static struct res_config wcl_cfg = {
 	.ibecc_available	= mtl_p_ibecc_available,
 	.err_addr_to_sys_addr	= adl_err_addr_to_sys_addr,
 	.err_addr_to_imc_addr	= adl_err_addr_to_imc_addr,
+};
+
+static struct res_config nvl_h_cfg = {
+	.machine_check			= true,
+	.num_imc			= 2,
+	.reg_mchbar_mask		= GENMASK_ULL(41, 17),
+	.reg_tom_mask			= GENMASK_ULL(41, 20),
+	.reg_touud_mask			= GENMASK_ULL(41, 20),
+	.reg_eccerrlog_addr_mask	= GENMASK_ULL(38, 5),
+	.reg_mem_config_offset		= 0x12904,
+	.reg_mem_config_ddr_type_mask	= GENMASK(8, 6),
+	.reg_mem_config_ibecc_en_mask	= GENMASK(3, 2),
+	.reg_mad_inter_size_mask[0]	= GENMASK(15, 8),
+	.reg_mad_inter_size_mask[1]	= GENMASK(23, 16),
+	.reg_mad_inter_size_granularity	= BIT_ULL(29),
+	.reg_mad_intra_rank_mask[0]	= BIT(7),
+	.reg_mad_intra_rank_mask[1]	= BIT(15),
+	.reg_mad_intra_width_mask[0]	= BIT(6),
+	.reg_mad_intra_width_mask[1]	= BIT(14),
+	.reg_mad_intra_density_mask[0]	= GENMASK(3, 0),
+	.reg_mad_intra_density_mask[1]	= GENMASK(11, 8),
+	.imc_base			= 0xd800,
+	.ibecc_base			= 0xd400,
+	.ibecc_error_log_offset		= 0x170,
+	.get_mem_type			= ptl_h_get_mem_type,
+	.get_dev_type			= ptl_h_get_dev_type,
+	.set_chan_params		= ptl_h_set_chan_params,
+	.set_dimm_params		= ptl_h_set_dimm_params,
+	.ibecc_available		= generic_ibecc_available,
+	.err_addr_to_sys_addr		= adl_err_addr_to_sys_addr,
+	.err_addr_to_imc_addr		= adl_err_addr_to_imc_addr,
 };
 
 static struct pci_device_id igen6_pci_tbl[] = {
@@ -866,6 +907,10 @@ static struct pci_device_id igen6_pci_tbl[] = {
 	{ PCI_VDEVICE(INTEL, DID_PTL_H_SKU13), (kernel_ulong_t)&ptl_h_cfg },
 	{ PCI_VDEVICE(INTEL, DID_PTL_H_SKU14), (kernel_ulong_t)&ptl_h_cfg },
 	{ PCI_VDEVICE(INTEL, DID_WCL_SKU1), (kernel_ulong_t)&wcl_cfg },
+	{ PCI_VDEVICE(INTEL, DID_NVL_H_SKU1), (kernel_ulong_t)&nvl_h_cfg },
+	{ PCI_VDEVICE(INTEL, DID_NVL_H_SKU2), (kernel_ulong_t)&nvl_h_cfg },
+	{ PCI_VDEVICE(INTEL, DID_NVL_H_SKU3), (kernel_ulong_t)&nvl_h_cfg },
+	{ PCI_VDEVICE(INTEL, DID_NVL_H_SKU4), (kernel_ulong_t)&nvl_h_cfg },
 	{ },
 };
 MODULE_DEVICE_TABLE(pci, igen6_pci_tbl);
