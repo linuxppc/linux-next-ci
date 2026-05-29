@@ -2281,6 +2281,14 @@ static void __queue_work(int cpu, struct workqueue_struct *wq,
 	unsigned int req_cpu = cpu;
 
 	/*
+	 * NOTE: Check whether the used workqueue is deprecated and warn
+	 */
+	if (unlikely(wq->flags & __WQ_DEPRECATED))
+		pr_warn_once("workqueue: work func %ps enqueued on deprecated workqueue. "
+			"Use system_{percpu|dfl}_wq instead.\n",
+			work->func);
+
+	/*
 	 * While a work item is PENDING && off queue, a task trying to
 	 * steal the PENDING will busy-loop waiting for it to either get
 	 * queued or lose PENDING.  Grabbing PENDING and queueing should
@@ -5808,7 +5816,7 @@ static struct workqueue_struct *__alloc_workqueue(const char *fmt,
 
 	/* see the comment above the definition of WQ_POWER_EFFICIENT */
 	if ((flags & WQ_POWER_EFFICIENT) && wq_power_efficient)
-		flags |= WQ_UNBOUND;
+		flags = (flags & ~WQ_PERCPU) | WQ_UNBOUND;
 
 	/* allocate wq and format name */
 	if (flags & WQ_UNBOUND)
@@ -5831,6 +5839,23 @@ static struct workqueue_struct *__alloc_workqueue(const char *fmt,
 	if (name_len >= WQ_NAME_LEN)
 		pr_warn_once("workqueue: name exceeds WQ_NAME_LEN. Truncating to: %s\n",
 			     wq->name);
+
+	/*
+	 * One among WQ_PERCPU and WQ_UNBOUND must be set, but not both.
+	 * - If neither is set, default to WQ_PERCPU
+	 * - If both are set, default to WQ_UNBOUND
+	 *
+	 * This code can be removed after workqueue are unbound by default
+	 */
+	if (unlikely(!(flags & (WQ_UNBOUND | WQ_PERCPU)))) {
+		WARN_ONCE(1, "workqueue: %s is using neither WQ_PERCPU or WQ_UNBOUND. "
+			  "Setting WQ_PERCPU.\n", wq->name);
+		flags |= WQ_PERCPU;
+	} else if (unlikely((flags & WQ_PERCPU) && (flags & WQ_UNBOUND))) {
+		WARN_ONCE(1, "workqueue: %s uses both WQ_PERCPU and WQ_UNBOUND. "
+			  "Dropped WQ_PERCPU, keeping WQ_UNBOUND.\n", wq->name);
+		flags &= ~WQ_PERCPU;
+	}
 
 	if (flags & WQ_BH) {
 		/*
@@ -8027,12 +8052,12 @@ void __init workqueue_init_early(void)
 		ordered_wq_attrs[i] = attrs;
 	}
 
-	system_wq = alloc_workqueue("events", WQ_PERCPU, 0);
+	system_wq = alloc_workqueue("events", WQ_PERCPU | __WQ_DEPRECATED, 0);
 	system_percpu_wq = alloc_workqueue("events", WQ_PERCPU, 0);
 	system_highpri_wq = alloc_workqueue("events_highpri",
 					    WQ_HIGHPRI | WQ_PERCPU, 0);
 	system_long_wq = alloc_workqueue("events_long", WQ_PERCPU, 0);
-	system_unbound_wq = alloc_workqueue("events_unbound", WQ_UNBOUND, WQ_MAX_ACTIVE);
+	system_unbound_wq = alloc_workqueue("events_unbound", WQ_UNBOUND | __WQ_DEPRECATED, WQ_MAX_ACTIVE);
 	system_dfl_wq = alloc_workqueue("events_unbound", WQ_UNBOUND, WQ_MAX_ACTIVE);
 	system_freezable_wq = alloc_workqueue("events_freezable",
 					      WQ_FREEZABLE | WQ_PERCPU, 0);
