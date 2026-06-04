@@ -147,13 +147,13 @@ static inline bool scx_is_cid_type(void)
 	return static_branch_unlikely(&__scx_is_cid_type);
 }
 
-static inline bool __scx_cmask_contains(const struct scx_cmask *m, u32 cid)
+static inline bool __scx_cmask_contains(u32 cid, const struct scx_cmask *m)
 {
 	return likely(cid >= m->base && cid < m->base + m->nr_cids);
 }
 
 /* Word in bits[] covering @cid. @cid must satisfy __scx_cmask_contains(). */
-static inline u64 *__scx_cmask_word(const struct scx_cmask *m, u32 cid)
+static inline u64 *__scx_cmask_word(u32 cid, const struct scx_cmask *m)
 {
 	return (u64 *)&m->bits[cid / 64 - m->base / 64];
 }
@@ -218,11 +218,54 @@ static inline void scx_cmask_reframe(struct scx_cmask *m, u32 base, u32 nr_cids)
 	m->nr_cids = nr_cids;
 }
 
-static inline void __scx_cmask_set(struct scx_cmask *m, u32 cid)
+static inline void __scx_cmask_set(u32 cid, struct scx_cmask *m)
 {
-	if (!__scx_cmask_contains(m, cid))
+	if (!__scx_cmask_contains(cid, m))
 		return;
-	*__scx_cmask_word(m, cid) |= BIT_U64(cid & 63);
+	*__scx_cmask_word(cid, m) |= BIT_U64(cid & 63);
 }
+
+/**
+ * scx_cmask_test - test whether @cid is set in @m
+ * @cid: cid to test
+ * @m: cmask to test
+ *
+ * Return %false if @cid is outside @m's active range. Otherwise return the
+ * bit's value. Read via READ_ONCE so callers can race set/clear writers.
+ */
+static inline bool scx_cmask_test(u32 cid, const struct scx_cmask *m)
+{
+	if (!__scx_cmask_contains(cid, m))
+		return false;
+	return READ_ONCE(*__scx_cmask_word(cid, m)) & BIT_U64(cid & 63);
+}
+
+/*
+ * Words of bits[] the active range spans, 0 if empty. Tighter than the storage
+ * SCX_CMASK_NR_WORDS() sizes for the worst-case base alignment.
+ */
+static inline u32 scx_cmask_nr_used_words(const struct scx_cmask *m)
+{
+	if (!m->nr_cids)
+		return 0;
+	return ((m->base & 63) + m->nr_cids - 1) / 64 + 1;
+}
+
+/**
+ * scx_cmask_for_each_cid - iterate set cids in @m
+ * @cid: s32 loop var that receives each set cid in turn
+ * @m: cmask to iterate
+ *
+ * Visits set bits within @m's active range in ascending order. Scans only the
+ * words the active range spans, where head and tail padding is kept zero, so
+ * no per-cid range check is needed.
+ */
+#define scx_cmask_for_each_cid(cid, m)						\
+	for (u64 __bs = (m)->base & ~63u, __wi = 0,				\
+		     __nw = scx_cmask_nr_used_words(m);				\
+	     __wi < __nw; __wi++)						\
+		for (u64 __w = READ_ONCE((m)->bits[__wi]);			\
+		     __w && ((cid) = __bs + __wi * 64 + __ffs64(__w), true);	\
+		     __w &= __w - 1)
 
 #endif /* _KERNEL_SCHED_EXT_CID_H */
